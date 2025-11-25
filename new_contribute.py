@@ -656,12 +656,16 @@ async def webhook():
     return jsonify({"status": "ok"})
 
 
+# 在 set_webhook_async 函数中（约第 575 行）
 async def set_webhook_async():
-    """异步设置 Webhook（兼容 Flask 2.0+）"""
     global application, webhook_set
     if not webhook_set and application is not None:
-        # 本地测试时注释此行，部署到 Vercel 后替换为实际域名
-        webhook_url = f"https://hy-telegram-bot.vercel.app/{TOKEN}"  # 替换为 Vercel 分配的域名
+        # 正确写法：使用 Vercel 自动注入的域名
+        vercel_url = os.getenv('VERCEL_URL')
+        if not vercel_url:
+            print("⚠️ 未获取到 VERCEL_URL，跳过 Webhook 设置（本地测试？）")
+            return
+        webhook_url = f"https://{vercel_url}/{TOKEN}"  # 自动拼接正确域名
         try:
             await application.bot.set_webhook(webhook_url)
             print(f"✅ Webhook 设置成功：{webhook_url}")
