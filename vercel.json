@@ -1,0 +1,8 @@
+{
+  "builds": [
+    { "src": "new_contribute.py", "use": "@vercel/python" }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "new_contribute.py" }
+  ]
+}
