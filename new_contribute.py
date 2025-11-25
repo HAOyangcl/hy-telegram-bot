@@ -2,43 +2,89 @@ import asyncio
 import re
 import logging
 import os
-from flask import Flask, request, jsonify
+import sys
+# Windows 用 msvcrt，Linux/macOS 用 fcntl（自动适配）
+try:
+    import fcntl
+except ImportError:
+    import msvcrt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 from telegram.error import RetryAfter, TimedOut
 from dotenv import load_dotenv
 
-# 加载环境变量（本地测试用）
+# 加载环境变量
 load_dotenv()
 
-# 配置日志（Vercel 环境使用控制台输出）
+# 配置日志
 logging.basicConfig(
     level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# 机器人配置（从环境变量读取 TOKEN）
-TOKEN = os.getenv("TOKEN")  # 本地默认值，部署时用环境变量覆盖
-CHANNEL_IDS = ['@yunpanNB', '@ammmziyuan']  # 多个频道ID
+# 机器人配置
+TOKEN = os.getenv("TOKEN")
+CHANNEL_IDS = ['@yunpanNB', '@ammmziyuan']
 SPECIFIC_CHANNELS = {
-    'quark': '@yunpanquark',  # 夸克网盘频道
-    'baidu': '@yunpanbaidu',  # 百度网盘频道
-    'uc': '@pxyunpanuc',  # UC网盘频道
-    'xunlei': '@pxyunpanxunlei'  # 迅雷网盘频道
+    'quark': '@yunpanquark', 'baidu': '@yunpanbaidu',
+    'uc': '@pxyunpanuc', 'xunlei': '@pxyunpanxunlei'
 }
 
-# 校验 Token 是否配置
+# Token 校验
 if not TOKEN:
-    raise ValueError("❌ 错误：未配置 Telegram 机器人 Token！\n"
-                     "本地测试：创建 .env 文件，添加 TOKEN=你的机器人Token\n"
-                     "Vercel 部署：在项目环境变量中添加 TOKEN=你的机器人Token")
+    raise ValueError("❌ 未配置 TOKEN！创建 .env 文件添加 TOKEN=xxx")
 
-# 用户数据存储（Vercel 是无状态的，生产环境需改用数据库）
+# 用户数据存储
 user_posts = {}
 user_states = {}
 
+class SingleInstanceLock:
+    def __init__(self, lock_file_path="bot_instance.lock"):
+        self.lock_file_path = lock_file_path
+        self.lock_file = None
+        self.is_locked = False
 
+    def acquire(self):
+        """获取锁，失败则抛出异常"""
+        try:
+            # 打开文件（不存在则创建）
+            self.lock_file = open(self.lock_file_path, 'w')
+            if sys.platform.startswith("win"):
+                # Windows：用 msvcrt 锁定文件
+                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)  # 非阻塞锁定
+            else:
+                # Linux/macOS：用 fcntl 锁定文件
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.is_locked = True
+            return True
+        except (BlockingIOError, PermissionError):
+            # 锁已被占用
+            if self.lock_file:
+                self.lock_file.close()
+                self.lock_file = None
+            return False
+
+    def release(self):
+        """释放锁"""
+        if self.is_locked and self.lock_file:
+            try:
+                if sys.platform.startswith("win"):
+                    msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.lock_file.close()
+                self.lock_file = None
+                self.is_locked = False
+                # 删除锁文件
+                if os.path.exists(self.lock_file_path):
+                    os.remove(self.lock_file_path)
+
+# PostManager 类（保持不变，完整复制之前的代码）
 class PostManager:
     def __init__(self):
         self.post_template = {
@@ -254,6 +300,7 @@ class PostManager:
 post_manager = PostManager()
 
 
+# 所有处理器函数（保持不变，确保 context 是 ContextTypes.DEFAULT_TYPE）
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     template_message = (
         "欢迎使用投稿机器人！\n\n"
@@ -413,140 +460,146 @@ async def show_my_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
 
 
-# 补充缺失的核心回调函数
-async def clear_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """清空投稿记录"""
-    user_id = update.callback_query.from_user.id
-    if user_id in user_posts:
-        del user_posts[user_id]
-    await update.callback_query.edit_message_text("投稿记录已清空。")
-    await asyncio.sleep(2)
-    await start(update, context)
+async def show_post_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
+    last_post = user_posts[user_id][-1]
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=last_post['image'],
+        caption=f"投稿预览：\n{last_post['caption']}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("确认发布", callback_data="confirm_post")],
+            [InlineKeyboardButton("重新编辑", callback_data="edit_post")]
+        ])
+    )
 
 
-async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理重新编辑投稿"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    if user_id in user_posts:
-        del user_posts[user_id]
-    await query.edit_message_text("已清空当前投稿，请重新发送新的投稿内容（格式与之前相同）。")
-
-
-async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """确认发布投稿到对应频道"""
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    if user_id not in user_posts:
-        await query.answer("找不到您的投稿内容，无法发布。")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in user_states and 'step' in user_states[user_id]:
+        await handle_step_post_message(update, context)
         return
 
-    success_count = 0
-    fail_count = 0
+    if not update.message.photo or not update.message.caption:
+        error_message = "投稿格式不正确，请按照模板重新投稿。\n\n"
+        error_message += (
+            "请按照以下格式投稿：\n\n"
+            "图片\n\n"
+            "名称：\n\n描述：\n\n链接：\n链接：\n...\n\n"
+            "📁 大小：\n🏷 标签："
+        )
+        keyboard = [
+            [InlineKeyboardButton("ℹ️ 查看详细说明", callback_data="post_info")],
+            [InlineKeyboardButton("◀️ 返回主菜单", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(error_message, reply_markup=reply_markup)
+        return
 
-    for post_data in user_posts[user_id]:
-        image = post_data['image']
-        caption = post_data['caption']
+    image = update.message.photo[-1].file_id
+    caption = update.message.caption
+    parsed_data = post_manager.strict_mode_parse(caption)
 
-        # 检测广告内容
+    if not parsed_data['name'] or not parsed_data['description']:
         if post_manager.detect_ad_content(caption):
-            await query.answer("检测到广告内容，无法发布。")
-            fail_count += 1
-            continue
-
-        # 去重链接
-        processed_caption = post_manager.remove_duplicate_links(caption)
-
-        # 提取链接
-        links = re.findall(r"链接：\s*(https?://[^\s\n]+)", processed_caption)
-        if not links:
-            await query.edit_message_text("发布失败：未识别到有效网盘链接！")
+            await update.message.reply_text(
+                "检测到您的投稿可能包含广告内容，无法发布。\n"
+                "请确保投稿内容符合规范，仅包含网盘资源链接。"
+            )
             return
 
-        # 识别链接类型
-        link_types = post_manager.identify_link_types(links)
-        if not link_types:
-            await query.edit_message_text("发布失败：未识别到支持的网盘类型（仅支持夸克、百度、UC、迅雷）！")
-            return
-
-        # 发送到基础频道（汇总+备用）
-        base_channels = CHANNEL_IDS
-        base_message = (
-            f"{processed_caption}\n"
-            f"\n📢 频道：@yunpanNB\n"
-            f"👥 群组：@naclzy\n"
-            f"🔗 获取更多资源：https://docs.qq.com/aio/DYmZYVGpFVGxOS3NE\n"
-            f"🎉 来源：https://link3.cc/pyxh"
+        pattern = (
+            r"名称：\s*.*\n\n"
+            r"描述：\s*.*\n\n"
+            r"(链接：\s*https?:\/\/[^\s]+\n)+\n"
+            r"📁 大小：\s*.*\n"
+            r"🏷 标签：\s*.*"
         )
 
-        for channel_id in base_channels:
-            try:
-                await context.bot.send_photo(chat_id=channel_id, photo=image, caption=base_message)
-                success_count += 1
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                try:
-                    await context.bot.send_photo(chat_id=channel_id, photo=image, caption=base_message)
-                    success_count += 1
-                except:
-                    fail_count += 1
-            except Exception as e:
-                logger.error(f"发送到基础频道 {channel_id} 失败：{e}")
-                fail_count += 1
-
-        # 发送到对应专门频道
-        for link_type in link_types:
-            if link_type in SPECIFIC_CHANNELS:
-                specific_caption = post_manager.create_channel_specific_caption(processed_caption, link_type)
-                specific_message = (
-                    f"{specific_caption}\n"
-                    f"📢 频道：@yunpanNB\n"
-                    f"👥 群组：@naclzy\n"
-                    f"🔗 获取更多资源：https://docs.qq.com/aio/DYmZYVGpFVGxOS3NE\n"
-                    f"🔗 交流讨论：https://link3.cc/pyxh"
+        if not re.search(pattern, caption, re.DOTALL):
+            fixed_caption = auto_fix_message(caption)
+            if post_manager.detect_ad_content(fixed_caption):
+                await update.message.reply_text(
+                    "检测到您的投稿可能包含广告内容，无法发布。\n"
+                    "请确保投稿内容符合规范，仅包含网盘资源链接。"
                 )
-                channel_id = SPECIFIC_CHANNELS[link_type]
-                try:
-                    await context.bot.send_photo(chat_id=channel_id, photo=image, caption=specific_message)
-                    success_count += 1
-                except RetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    try:
-                        await context.bot.send_photo(chat_id=channel_id, photo=image, caption=specific_message)
-                        success_count += 1
-                    except:
-                        fail_count += 1
-                except Exception as e:
-                    logger.error(f"发送到专门频道 {channel_id} 失败：{e}")
-                    fail_count += 1
+                return
 
-    # 回复用户结果
-    if fail_count == 0:
-        await query.edit_message_text(f"✅ 投稿成功！已发布到 {success_count} 个频道～ 感谢支持！")
+            if not re.search(pattern, fixed_caption, re.DOTALL):
+                error_message = "投稿格式不正确，请按照模板重新投稿。\n\n"
+                error_message += (
+                    "请按照以下格式投稿：\n\n"
+                    "图片\n\n"
+                    "名称：\n\n描述：\n\n链接：\n链接：\n...\n\n"
+                    "📁 大小：\n🏷 标签："
+                )
+                keyboard = [
+                    [InlineKeyboardButton("ℹ️ 查看详细说明", callback_data="post_info")],
+                    [InlineKeyboardButton("◀️ 返回主菜单", callback_data="back_to_main")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text(error_message, reply_markup=reply_markup)
+                return
+            caption = fixed_caption
+
+        if user_id not in user_posts:
+            user_posts[user_id] = []
+        user_posts[user_id].append({'image': image, 'caption': caption})
     else:
-        await query.edit_message_text(f"⚠️ 投稿部分成功：成功 {success_count} 个，失败 {fail_count} 个～")
+        try:
+            standard_caption = post_manager.create_post_caption(parsed_data)
+            if user_id not in user_posts:
+                user_posts[user_id] = []
+            user_posts[user_id].append({'image': image, 'caption': standard_caption})
+        except ValueError as e:
+            await update.message.reply_text(f"投稿被拒绝：{str(e)}")
+            return
 
-    # 清空投稿记录
-    if user_id in user_posts:
-        del user_posts[user_id]
-
-    await asyncio.sleep(2)
-    await start(update, context)
-
-
-async def cancel_step_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """取消分步投稿"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-    await query.edit_message_text("分步投稿已取消。")
-    await asyncio.sleep(2)
-    await start(update, context)
+    await show_post_preview(update, context, user_id)
 
 
-# 按钮回调总处理
+def auto_fix_message(caption):
+    name_match = re.search(r"名称[：:]\s*(.+?)(?=\n|$)", caption)
+    desc_match = re.search(r"(?:描述|简介)[：:]\s*(.+?)(?=\n(?:链接|夸克|百度|UC|迅雷|📁|🏷)|$)", caption, re.DOTALL)
+
+    links = []
+    link_patterns = [
+        r"链接[：:]\s*(https?://[^\s\n]+)",
+        r"(夸克|百度|UC|迅雷)[：:]\s*(https?://[^\s\n]+(?:\?pwd=[^\s\n]+)?)",
+        r"(https?://(?:pan\.quark\.cn/s/[^\s\n]+|pan\.baidu\.com/s/[^\s\n]+(?:\?pwd=[^\s\n]+)?|drive\.uc\.cn/[^\s\n]+|pan\.xunlei\.com/s/[^\s\n]+(?:\?pwd=[^\s\n]+)?))"
+    ]
+
+    for pattern in link_patterns:
+        matches = re.findall(pattern, caption)
+        for match in matches:
+            if isinstance(match, tuple):
+                link = match[1] if len(match) > 1 else match[0]
+            else:
+                link = match
+            if link not in links:
+                links.append(link)
+
+    links_formatted = [f"链接：{link}" for link in links] if links else ["链接：https://pan.quark.cn/s/3c07afa156f3"]
+
+    size_match = re.search(r"大小[：:]\s*(.+?)(?=\n|$)", caption)
+    tag_match = re.search(r"标签[：:]\s*(.+?)(?=\n|$)", caption)
+
+    name = name_match.group(1).strip() if name_match else "未提供"
+    description = desc_match.group(1).strip() if desc_match else "未提供"
+    size = size_match.group(1).strip() if size_match else "NG"
+    tags = tag_match.group(1).strip() if tag_match else "#网盘资源"
+
+    newline = "\n"
+    fixed_caption = (
+        f"名称：{name}\n\n"
+        f"描述：{description}\n\n"
+        f"{newline.join(links_formatted)}\n\n"
+        f"📁 大小：{size}\n"
+        f"🏷 标签：{tags}"
+    )
+
+    return fixed_caption
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -567,126 +620,241 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_edit_callback(update, context)
     elif data == "confirm_post":
         await handle_confirm_callback(update, context)
+    elif data == "cancel_post":
+        await cancel_post(update, context)
     elif data == "cancel_step_post":
         await cancel_step_post(update, context)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理快速投稿消息"""
-    user_id = update.message.from_user.id
+async def clear_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.callback_query.from_user.id
+    if user_id in user_posts:
+        del user_posts[user_id]
+    await update.callback_query.edit_message_text("投稿记录已清空。")
+    await asyncio.sleep(2)
+    await start(update, context)
 
-    # 检查是否在分步投稿中
-    if user_id in user_states and 'step' in user_states[user_id]:
-        await handle_step_post_message(update, context)
-        return
 
-    # 检查快速投稿格式（图片+文字说明）
-    if not update.message.photo or not update.message.caption:
-        error_message = "❌ 投稿格式不正确！\n\n请按照以下格式投稿：\n1. 发送一张图片作为封面\n2. 图片说明中填写：\n名称：资源名称\n描述：资源描述\n链接：网盘链接1\n链接：网盘链接2\n📁 大小：资源大小\n🏷 标签：标签1 标签2"
-        keyboard = [
-            [InlineKeyboardButton("ℹ️ 查看详细说明", callback_data="post_info")],
-            [InlineKeyboardButton("◀️ 返回主菜单", callback_data="back_to_main")]
-        ]
-        await update.message.reply_text(error_message, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id in user_posts:
+        del user_posts[user_id]
+    await query.edit_message_text("请重新发送新的投稿内容，格式与之前相同。")
 
-    # 解析投稿内容
-    image = update.message.photo[-1].file_id
-    caption = update.message.caption
-    parsed_data = post_manager.strict_mode_parse(caption)
 
-    # 检测广告
-    if post_manager.detect_ad_content(caption):
-        await update.message.reply_text("❌ 检测到广告内容，无法投稿！")
-        return
-
-    # 生成标准格式
-    try:
-        standard_caption = post_manager.create_post_caption(parsed_data)
-    except ValueError as e:
-        await update.message.reply_text(f"❌ 投稿失败：{str(e)}")
-        return
-
-    # 保存投稿
+async def handle_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
     if user_id not in user_posts:
-        user_posts[user_id] = []
-    user_posts[user_id].append({'image': image, 'caption': standard_caption})
+        await query.answer("找不到您的投稿内容，无法发送到频道。")
+        return
 
-    # 显示预览
-    await show_post_preview(update, context, user_id)
+    success_count = 0
+    fail_count = 0
+
+    for post_data in user_posts[user_id]:
+        image = post_data['image']
+        caption = post_data['caption']
+
+        if post_manager.detect_ad_content(caption):
+            await query.answer("检测到广告内容，无法发布。")
+            fail_count += 1
+            continue
+
+        processed_caption = post_manager.remove_duplicate_links(caption)
+        links = re.findall(r"链接：\s*(https?://[^\s\n]+)", processed_caption)
+
+        if not links:
+            await query.answer("未识别到任何有效链接，请检查链接格式。")
+            await query.edit_message_text("发布失败：未识别到任何有效链接，请检查链接格式。\n\n"
+                                          "链接应以以下格式之一开头：\n"
+                                          "- https://pan.quark.cn/\n"
+                                          "- https://pan.baidu.com/\n"
+                                          "- https://drive.uc.cn/\n"
+                                          "- https://pan.xunlei.com/\n\n"
+                                          "请编辑或重新投稿。")
+            return
+
+        link_types = post_manager.identify_link_types(links)
+        if not link_types:
+            unrecognized_links = []
+            for link in links:
+                if link.startswith("链接："):
+                    url = link[3:].strip()
+                else:
+                    url = link.strip()
+                unrecognized_links.append(url)
+
+            await query.answer("发现未识别的链接类型。")
+            await query.edit_message_text(f"发布失败：发现未识别的链接类型。\n\n"
+                                          f"未识别的链接：\n" +
+                                          "\n".join(unrecognized_links) +
+                                          "\n\n链接应以以下格式之一开头：\n"
+                                          "- https://pan.quark.cn/\n"
+                                          "- https://pan.baidu.com/\n"
+                                          "- https://drive.uc.cn/\n"
+                                          "- https://pan.xunlei.com/\n\n"
+                                          "请编辑或重新投稿。")
+            return
+
+        base_channels = CHANNEL_IDS
+        base_message = (
+            f"{processed_caption}\n"
+            f"\n📢 频道：@yunpanNB\n"
+            f"👥 群组：@naclzy\n"
+            f"🔗 获取更多资源：https://docs.qq.com/aio/DYmZYVGpFVGxOS3NE\n"
+            f"🎉 来源：https://link3.cc/pyxh"
+        )
+
+        for channel_id in base_channels:
+            try:
+                await context.bot.send_photo(chat_id=channel_id, photo=image, caption=base_message)
+                success_count += 1
+            except RetryAfter as e:
+                retry_after = e.retry_after
+                await asyncio.sleep(retry_after)
+                try:
+                    await context.bot.send_photo(chat_id=channel_id, photo=image, caption=base_message)
+                    success_count += 1
+                except:
+                    fail_count += 1
+                    continue
+            except TimedOut:
+                await asyncio.sleep(5)
+                try:
+                    await context.bot.send_photo(chat_id=channel_id, photo=image, caption=base_message)
+                    success_count += 1
+                except:
+                    fail_count += 1
+                    continue
+            except Exception as e:
+                logger.error(f"Error while sending post to channel {channel_id}: {e}")
+                fail_count += 1
+
+        for link_type in link_types:
+            if link_type in SPECIFIC_CHANNELS:
+                specific_caption = post_manager.create_channel_specific_caption(processed_caption, link_type)
+                specific_message = (
+                    f"{specific_caption}\n"
+                    f"📢 频道：@yunpanNB\n"
+                    f"👥 群组：@naclzy\n"
+                    f"🔗 获取更多资源：https://docs.qq.com/aio/DYmZYVGpFVGxOS3NE\n"
+                    f"🔗交流讨论：https://link3.cc/pyxh"
+                )
+                channel_id = SPECIFIC_CHANNELS[link_type]
+                try:
+                    await context.bot.send_photo(chat_id=channel_id, photo=image, caption=specific_message)
+                    success_count += 1
+                except RetryAfter as e:
+                    retry_after = e.retry_after
+                    await asyncio.sleep(retry_after)
+                    try:
+                        await context.bot.send_photo(chat_id=channel_id, photo=image, caption=specific_message)
+                        success_count += 1
+                    except:
+                        fail_count += 1
+                        continue
+                except TimedOut:
+                    await asyncio.sleep(5)
+                    try:
+                        await context.bot.send_photo(chat_id=channel_id, photo=image, caption=specific_message)
+                        success_count += 1
+                    except:
+                        fail_count += 1
+                        continue
+                except Exception as e:
+                    logger.error(f"Error while sending post to channel {channel_id}: {e}")
+                    fail_count += 1
+
+    if fail_count == 0:
+        await query.answer("内容已成功发布到所有频道！")
+        await query.edit_message_text(f"您的投稿已成功发布到所有频道（共{success_count}条）。\n感谢您的支持！")
+    else:
+        await query.answer("部分内容发布失败")
+        await query.edit_message_text(
+            f"您的投稿发布完成：\n成功：{success_count}条\n失败：{fail_count}条\n感谢您的支持！")
+
+    if user_id in user_posts:
+        del user_posts[user_id]
+
+    await asyncio.sleep(2)
+    await start(update, context)
 
 
-async def show_post_preview(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
-    """显示投稿预览"""
-    last_post = user_posts[user_id][-1]
-    await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=last_post['image'],
-        caption=f"📋 投稿预览：\n{last_post['caption']}\n\n请选择操作：",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ 确认发布", callback_data="confirm_post")],
-            [InlineKeyboardButton("✏️ 重新编辑", callback_data="edit_post")],
-            [InlineKeyboardButton("❌ 取消投稿", callback_data="back_to_main")]
-        ])
-    )
+async def cancel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id in user_posts:
+        del user_posts[user_id]
+    await query.edit_message_text("投稿已取消。")
+    await asyncio.sleep(2)
+    await start(update, context)
 
 
-# Flask 应用配置（适配 Vercel Webhook）
-app = Flask(__name__)
-application = None  # 全局 Telegram Application 实例
-webhook_set = False  # 标记 Webhook 是否已设置
+async def cancel_step_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id in user_states:
+        del user_states[user_id]
+    await query.edit_message_text("分步投稿已取消。")
+    await asyncio.sleep(2)
+    await start(update, context)
 
 
-@app.route(f"/{TOKEN}", methods=["POST"])
-async def webhook():
-    """接收 Telegram Webhook 请求"""
-    global application
-    if application is None:
-        # 初始化 Telegram 应用
+# 本地测试专用：纯长轮询，无 Flask Webhook
+def main():
+    # 初始化单实例锁
+    instance_lock = SingleInstanceLock()
+
+    try:
+        # 获取实例锁（防止重复启动）
+        if not instance_lock.acquire():
+            print("❌ 错误：已有一个机器人实例正在运行！")
+            print("请关闭所有 Python 进程后重试（任务管理器 → 结束 python.exe）。")
+            sys.exit(1)
+
+        # 初始化机器人应用
         application = Application.builder().token(TOKEN).build()
+
         # 注册所有处理器
         application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, handle_message))  # 快速投稿（图片+文字）
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_step_post_message))  # 分步投稿文字
+        application.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, handle_message))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_step_post_message))
         application.add_handler(CallbackQueryHandler(button_handler))
 
-    # 处理 Telegram 更新
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return jsonify({"status": "ok"})
+        print("✅ 本地测试：启动长轮询（已禁用 Webhook + 跨平台单实例锁定）...")
+        print(f"🤖 机器人 Token：{TOKEN[:10]}...（隐藏部分字符）")
+        print(f"🔒 已锁定实例，防止重复启动")
 
+        # 启动长轮询（关键参数：drop_pending_updates 丢弃历史更新）
+        application.run_polling(
+            drop_pending_updates=True,
+            timeout=30,
+            poll_interval=5  # 轮询间隔 5 秒，减少服务器冲突
+        )
 
-# 在 set_webhook_async 函数中（约第 575 行）
-async def set_webhook_async():
-    global application, webhook_set
-    if not webhook_set and application is not None:
-        # 正确写法：使用 Vercel 自动注入的域名
-        vercel_url = os.getenv('VERCEL_URL')
-        if not vercel_url:
-            print("⚠️ 未获取到 VERCEL_URL，跳过 Webhook 设置（本地测试？）")
-            return
-        webhook_url = f"https://{vercel_url}/{TOKEN}"  # 自动拼接正确域名
-        try:
-            await application.bot.set_webhook(webhook_url)
-            print(f"✅ Webhook 设置成功：{webhook_url}")
-            webhook_set = True
-        except Exception as e:
-            print(f"❌ Webhook 设置失败：{e}")
-
-
-# Flask 2.0+ 替代 before_first_request 的方案
-@app.before_request
-def before_request():
-    """每次请求前检查 Webhook 是否设置（仅第一次请求时执行）"""
-    global application
-    if application is None:
-        # 初始化 Telegram 应用
-        application = Application.builder().token(TOKEN).build()
-        # 异步设置 Webhook（不阻塞请求）
-        asyncio.run(set_webhook_async())
+    except Exception as e:
+        # print(f"❌ 机器人启动失败：{str(e)}")
+        logger.error(f"Bot start failed: {str(e)}")
+        sys.exit(1)
+    finally:
+        # 确保程序退出时释放锁
+        instance_lock.release()
+        print("🔓 实例锁已释放")
 
 
 if __name__ == "__main__":
-    # 本地测试时运行 Flask 服务（端口默认 5000）
-    print("🚀 本地测试服务启动中...")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    # Windows 系统事件循环兼容性处理（关键）
+    if sys.platform.startswith("win"):
+        try:
+            import asyncio
+            from asyncio import WindowsSelectorEventLoopPolicy
+
+            asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+            print("💻 Windows 系统事件循环已兼容配置")
+        except Exception as e:
+            print(f"⚠️ Windows 事件循环设置警告：{str(e)}")
+
+    # 启动机器人（带跨平台单实例锁定）
+    main()
