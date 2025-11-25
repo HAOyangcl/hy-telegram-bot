@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 机器人配置（从环境变量读取 TOKEN）
-TOKEN = os.getenv("TOKEN", "7277523854:AAHUKfxzyzgXAIJ8VqPjoAuiG2Ft15Z1fu0")  # 本地默认值，部署时用环境变量覆盖
+TOKEN = os.getenv("TOKEN")  # 本地默认值，部署时用环境变量覆盖
 CHANNEL_IDS = ['@yunpanNB', '@ammmziyuan']  # 多个频道ID
 SPECIFIC_CHANNELS = {
     'quark': '@yunpanquark',  # 夸克网盘频道
@@ -27,6 +27,12 @@ SPECIFIC_CHANNELS = {
     'uc': '@pxyunpanuc',  # UC网盘频道
     'xunlei': '@pxyunpanxunlei'  # 迅雷网盘频道
 }
+
+# 校验 Token 是否配置
+if not TOKEN:
+    raise ValueError("❌ 错误：未配置 Telegram 机器人 Token！\n"
+                     "本地测试：创建 .env 文件，添加 TOKEN=你的机器人Token\n"
+                     "Vercel 部署：在项目环境变量中添加 TOKEN=你的机器人Token")
 
 # 用户数据存储（Vercel 是无状态的，生产环境需改用数据库）
 user_posts = {}
@@ -655,7 +661,7 @@ async def set_webhook_async():
     global application, webhook_set
     if not webhook_set and application is not None:
         # 本地测试时注释此行，部署到 Vercel 后替换为实际域名
-        webhook_url = f"https://你的项目名.vercel.app/{TOKEN}"  # 替换为 Vercel 分配的域名
+        webhook_url = f"https://hy-telegram-bot.vercel.app/{TOKEN}"  # 替换为 Vercel 分配的域名
         try:
             await application.bot.set_webhook(webhook_url)
             print(f"✅ Webhook 设置成功：{webhook_url}")
